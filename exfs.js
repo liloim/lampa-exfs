@@ -1,6 +1,6 @@
 /*!
  * EX-FS plugin for Lampa
- * Version: 0.2.0
+ * Version: 0.3.0
  *
  * What it does:
  * - Adds an "EX-FS" button to movie/series cards
@@ -20,7 +20,7 @@
 
     var manifest = {
         type: 'video',
-        version: '0.2.0',
+        version: '0.3.0',
         name: 'EX-FS',
         description: 'EX-FS public direct-stream and iframe integration for Lampa',
         component: 'exfs_online'
@@ -80,24 +80,46 @@
         var network = new Lampa.Reguest();
         network.timeout(20000);
 
-        network.silent(
-            proxify(url),
-            function (response) {
-                success(response);
-            },
-            function (a, b) {
-                if (error) error(a, b);
-            },
-            post || false,
-            {
-                dataType: 'text',
-                headers: {
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                    'Accept-Language': 'uk,ru;q=0.9,en;q=0.8',
-                    'Referer': getDomain() + '/'
-                }
+        var target = proxify(url);
+        var options = {
+            dataType: 'text',
+            headers: {
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'uk,ru;q=0.9,en;q=0.8',
+                'Referer': getDomain() + '/'
             }
-        );
+        };
+
+        if (post) {
+            options.headers['Content-Type'] = 'application/x-www-form-urlencoded; charset=UTF-8';
+        }
+
+        var done = function (response) {
+            if (typeof response !== 'string') {
+                try { response = JSON.stringify(response); } catch (e) {}
+            }
+            success(response || '');
+        };
+
+        var fail = function (a, b) {
+            if (error) error(a, b);
+        };
+
+        /*
+         * Android Lampa has a native network layer. Use it first:
+         * it is the correct way to load cross-origin HTML on Android/TV Box.
+         * Browser/Tizen/WebOS still need a CORS proxy if the remote site
+         * does not allow cross-origin requests.
+         */
+        try {
+            if (Lampa.Platform && Lampa.Platform.is && Lampa.Platform.is('android') && network.native) {
+                network.native(target, done, fail, post || false, options);
+            } else {
+                network.silent(target, done, fail, post || false, options);
+            }
+        } catch (e) {
+            fail(e);
+        }
 
         return network;
     }
@@ -106,6 +128,15 @@
         var root = document.createElement('div');
         root.innerHTML = html || '';
         return root;
+    }
+
+    function escapeHtml(value) {
+        return String(value == null ? '' : value)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#039;');
     }
 
     function cleanTitle(s) {
@@ -174,8 +205,11 @@
             }
 
             callback(found);
-        }, function () {
-            callback([]);
+        }, function (a, b) {
+            console.log('EX-FS search error', a, b);
+            callback([], {
+                message: 'EX-FS: помилка мережі. На Android використовується native-запит; у браузері потрібен CORS-проксі.'
+            });
         }, post);
     }
 
@@ -423,6 +457,7 @@
 
     function component(object) {
         var self = this;
+        var initialized = false;
         var network = new Lampa.Reguest();
         var scroll = new Lampa.Scroll({ mask: true, over: true });
         var files = new Lampa.Explorer(object);
@@ -442,6 +477,11 @@
 
         this.start = function () {
             if (Lampa.Activity.active().activity !== this.activity) return;
+
+            if (!initialized) {
+                initialized = true;
+                this.initialize();
+            }
 
             try {
                 Lampa.Background.immediately(
@@ -506,8 +546,8 @@
         function addRow(title, subtitle, enter) {
             var item = $(
                 '<div class="online selector">' +
-                    '<div class="online__title">' + Lampa.Utils.escape(title) + '</div>' +
-                    '<div class="online__quality">' + Lampa.Utils.escape(subtitle || '') + '</div>' +
+                    '<div class="online__title">' + escapeHtml(title) + '</div>' +
+                    '<div class="online__quality">' + escapeHtml(subtitle || '') + '</div>' +
                 '</div>'
             );
 
@@ -620,7 +660,15 @@
                 return;
             }
 
-            searchExfs(title, year, showResults);
+            searchExfs(title, year, function (results, err) {
+                if (err) {
+                    showError(err.message || 'EX-FS: помилка пошуку');
+                    self.activity.loader(false);
+                    self.activity.toggle();
+                    return;
+                }
+                showResults(results);
+            });
         };
     }
 
@@ -656,6 +704,42 @@
         });
     }
 
+    function addExfsButton(root, movie) {
+        if (!root || !root.length || root.find('.view--exfs').length) return;
+
+        var label =
+            '<svg class="button__icon" width="22" height="22" viewBox="0 0 24 24" fill="none">' +
+                '<path d="M8 5v14l11-7z" fill="currentColor"/>' +
+            '</svg>' +
+            '<span>EX-FS</span>';
+
+        var button = $(
+            '<div class="full-start__button selector view--online view--exfs">' +
+                label +
+            '</div>'
+        );
+
+        button.on('hover:enter', function () {
+            openExfs(movie);
+        });
+
+        var torrent = root.find('.view--torrent');
+        if (torrent.length) {
+            torrent.after(button);
+            return;
+        }
+
+        var online = root.find('.view--online').first();
+        if (online.length) {
+            online.after(button);
+            return;
+        }
+
+        var box = root.find('.full-start-new__buttons');
+        if (!box.length) box = root.find('.full-start__buttons');
+        if (box.length) box.prepend(button);
+    }
+
     function addCardButton() {
         var styleId = 'exfs-plugin-style';
 
@@ -663,42 +747,24 @@
             var st = document.createElement('style');
             st.id = styleId;
             st.innerHTML =
-                '.full-start__button.view--exfs{' +
-                    'background:#202020;' +
-                    'color:#fff' +
-                '}' +
+                '.full-start__button.view--exfs{background:#202020;color:#fff}' +
                 '.view--exfs .button__icon{margin-right:.4em}';
             document.head.appendChild(st);
         }
 
         Lampa.Listener.follow('full', function (e) {
             if (e.type !== 'complite') return;
-
-            var root = e.object.activity.render();
-            var box = root.find('.full-start-new__buttons');
-
-            if (!box.length) box = root.find('.full-start__buttons');
-            if (!box.length) return;
-            if (root.find('.view--exfs').length) return;
-
-            var label =
-                '<svg class="button__icon" width="22" height="22" viewBox="0 0 24 24" fill="none">' +
-                    '<path d="M8 5v14l11-7z" fill="currentColor"/>' +
-                '</svg>' +
-                '<span>EX-FS</span>';
-
-            var button = $(
-                '<div class="full-start__button selector view--online view--exfs">' +
-                    label +
-                '</div>'
-            );
-
-            button.on('hover:enter', function () {
-                openExfs(e.data.movie);
-            });
-
-            box.prepend(button);
+            addExfsButton(e.object.activity.render(), e.data.movie);
         });
+
+        // If plugin is installed while a movie card is already open,
+        // add the button without requiring navigation away first.
+        try {
+            var active = Lampa.Activity.active();
+            if (active && active.component === 'full' && active.activity) {
+                addExfsButton(active.activity.render(), active.card || active.movie || {});
+            }
+        } catch (e) {}
     }
 
     function addSettings() {
@@ -746,25 +812,10 @@
 
     function registerManifest() {
         try {
-            if (!Lampa.Manifest) Lampa.Manifest = {};
-
-            if (Array.isArray(Lampa.Manifest.plugins)) {
-                var exists = Lampa.Manifest.plugins.some(function (p) {
-                    return p && p.component === manifest.component;
-                });
-
-                if (!exists) Lampa.Manifest.plugins.push(manifest);
-            } else if (
-                typeof Lampa.Manifest.plugins === 'object' &&
-                Lampa.Manifest.plugins
-            ) {
-                Lampa.Manifest.plugins[manifest.component] = manifest;
-            } else {
-                var box = {};
-                box[manifest.component] = manifest;
-                Lampa.Manifest.plugins = box;
-            }
-        } catch (e) {}
+            Lampa.Manifest.plugins = manifest;
+        } catch (e) {
+            console.log('EX-FS manifest error', e);
+        }
     }
 
     function startPlugin() {
@@ -776,10 +827,10 @@
             registerManifest();
             registerComponent();
             addSettings();
-            addOnlineSource();
             addCardButton();
 
-            console.log('EX-FS', 'plugin started');
+            console.log('EX-FS', 'plugin v0.3.0 started');
+            try { Lampa.Noty.show('EX-FS v0.3 завантажено'); } catch (e) {}
         } catch (e) {
             console.log('EX-FS start error', e);
             try {
