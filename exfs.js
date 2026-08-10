@@ -1,136 +1,31 @@
 /*!
- * EX-FS plugin for Lampa
- * Version: 0.3.0
+ * EX-FS for Lampa
+ * Version: 0.4.0
  *
- * What it does:
- * - Adds an "EX-FS" button to movie/series cards
- * - Searches ex-fs.net using the public site search
- * - Opens publicly exposed player iframes inside Lampa
+ * Rewritten from scratch against the current Lampa plugin pattern.
  *
- * What it does NOT do:
- * - No DRM/Cloudflare/CAPTCHA bypass
- * - No deobfuscation or extraction of protected direct stream URLs
+ * Features:
+ * - EX-FS button on movie/series card
+ * - Search on ex-fs.net
+ * - Result list inside Lampa
+ * - Public direct HLS/MP4 -> Lampa.Player
+ * - Public iframe players -> internal iframe fallback
+ *
+ * No DRM/CAPTCHA/Cloudflare bypass and no extraction from protected
+ * third-party embedded players.
  */
-
 (function () {
     'use strict';
 
-    if (window.exfs_plugin_ready) return;
-    window.exfs_plugin_ready = true;
+    var VERSION = '0.4.0';
+    var DOMAIN = 'https://ex-fs.net';
+    var COMPONENT = 'exfs_online_v4';
+    var FRAME_COMPONENT = 'exfs_frame_v4';
 
-    var manifest = {
-        type: 'video',
-        version: '0.3.0',
-        name: 'EX-FS',
-        description: 'EX-FS public direct-stream and iframe integration for Lampa',
-        component: 'exfs_online'
-    };
+    if (window.__exfs_v4_loaded) return;
+    window.__exfs_v4_loaded = true;
 
-    var STORAGE = {
-        domain: 'exfs_domain',
-        proxy: 'exfs_proxy'
-    };
-
-    function ensureDefaults() {
-        var defaults = {};
-        defaults[STORAGE.domain] = 'https://ex-fs.net';
-        defaults[STORAGE.proxy] = '';
-
-        Object.keys(defaults).forEach(function (key) {
-            try {
-                var cur = Lampa.Storage.get(key, '__none__');
-                if (cur === '__none__' || cur === null || cur === undefined) {
-                    Lampa.Storage.set(key, defaults[key]);
-                }
-            } catch (e) {}
-        });
-    }
-
-    function getDomain() {
-        var d = (Lampa.Storage.get(STORAGE.domain) || 'https://ex-fs.net').trim();
-        if (!/^https?:\/\//i.test(d)) d = 'https://' + d;
-        return d.replace(/\/+$/, '');
-    }
-
-    function proxify(url) {
-        var p = (Lampa.Storage.get(STORAGE.proxy) || '').trim();
-        if (!p) return url;
-
-        // Generic prefix proxy:
-        // https://proxy.example/fetch?url=
-        if (p.indexOf('{url}') >= 0) {
-            return p.replace('{url}', encodeURIComponent(url));
-        }
-
-        // Simple path proxy:
-        // https://proxy.example/
-        if (p.slice(-1) !== '/') p += '/';
-        return p + url;
-    }
-
-    function absoluteUrl(url) {
-        if (!url) return '';
-        if (/^https?:\/\//i.test(url)) return url;
-        if (url.indexOf('//') === 0) return 'https:' + url;
-        if (url.charAt(0) === '/') return getDomain() + url;
-        return getDomain() + '/' + url;
-    }
-
-    function request(url, success, error, post) {
-        var network = new Lampa.Reguest();
-        network.timeout(20000);
-
-        var target = proxify(url);
-        var options = {
-            dataType: 'text',
-            headers: {
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Accept-Language': 'uk,ru;q=0.9,en;q=0.8',
-                'Referer': getDomain() + '/'
-            }
-        };
-
-        if (post) {
-            options.headers['Content-Type'] = 'application/x-www-form-urlencoded; charset=UTF-8';
-        }
-
-        var done = function (response) {
-            if (typeof response !== 'string') {
-                try { response = JSON.stringify(response); } catch (e) {}
-            }
-            success(response || '');
-        };
-
-        var fail = function (a, b) {
-            if (error) error(a, b);
-        };
-
-        /*
-         * Android Lampa has a native network layer. Use it first:
-         * it is the correct way to load cross-origin HTML on Android/TV Box.
-         * Browser/Tizen/WebOS still need a CORS proxy if the remote site
-         * does not allow cross-origin requests.
-         */
-        try {
-            if (Lampa.Platform && Lampa.Platform.is && Lampa.Platform.is('android') && network.native) {
-                network.native(target, done, fail, post || false, options);
-            } else {
-                network.silent(target, done, fail, post || false, options);
-            }
-        } catch (e) {
-            fail(e);
-        }
-
-        return network;
-    }
-
-    function parseHtml(html) {
-        var root = document.createElement('div');
-        root.innerHTML = html || '';
-        return root;
-    }
-
-    function escapeHtml(value) {
+    function esc(value) {
         return String(value == null ? '' : value)
             .replace(/&/g, '&amp;')
             .replace(/</g, '&lt;')
@@ -139,257 +34,419 @@
             .replace(/'/g, '&#039;');
     }
 
-    function cleanTitle(s) {
-        return (s || '')
+    function clean(value) {
+        return String(value || '').replace(/\s+/g, ' ').trim();
+    }
+
+    function normalize(value) {
+        return clean(value)
+            .toLowerCase()
+            .replace(/ё/g, 'е')
+            .replace(/[–—−‐‑‒―]/g, '-')
+            .replace(/[^a-zа-яіїєґ0-9]+/gi, ' ')
             .replace(/\s+/g, ' ')
-            .replace(/\s*(смотреть|дивитися)\s+онлайн.*$/i, '')
             .trim();
     }
 
-    function searchExfs(query, year, callback) {
-        // EX-FS is DLE-based. Public DLE search POST.
-        var url = getDomain() + '/index.php?do=search';
-        var post =
-            'do=search' +
-            '&subaction=search' +
-            '&search_start=0' +
-            '&full_search=0' +
-            '&result_from=1' +
-            '&story=' + encodeURIComponent(query);
+    function absolute(url, base) {
+        url = clean(url);
+        base = base || DOMAIN + '/';
 
-        request(url, function (html) {
-            var root = parseHtml(html);
-            var found = [];
-            var seen = {};
-
-            var anchors = root.querySelectorAll('a[href]');
-            Array.prototype.forEach.call(anchors, function (a) {
-                var href = a.getAttribute('href') || '';
-
-                if (!/(\/film\/|\/serials\/|\/multfilm\/|\/multserial\/|\/tv-show\/|\/show\/)/i.test(href)) {
-                    return;
-                }
-
-                href = absoluteUrl(href);
-                if (seen[href]) return;
-
-                var title = cleanTitle(a.textContent || a.getAttribute('title') || '');
-                if (!title || title.length < 2) return;
-
-                var parent = a.parentNode;
-                var text = '';
-                for (var i = 0; i < 4 && parent; i++, parent = parent.parentNode) {
-                    text += ' ' + (parent.textContent || '');
-                }
-
-                var ym = text.match(/\b(19|20)\d{2}\b/);
-                var itemYear = ym ? ym[0] : '';
-
-                seen[href] = true;
-                found.push({
-                    url: href,
-                    title: title,
-                    year: itemYear
-                });
-            });
-
-            if (year) {
-                var exact = found.filter(function (item) {
-                    return String(item.year) === String(year);
-                });
-
-                if (exact.length) {
-                    callback(exact);
-                    return;
-                }
-            }
-
-            callback(found);
-        }, function (a, b) {
-            console.log('EX-FS search error', a, b);
-            callback([], {
-                message: 'EX-FS: помилка мережі. На Android використовується native-запит; у браузері потрібен CORS-проксі.'
-            });
-        }, post);
-    }
-
-
-    function findDirectMedia(pageUrl, html) {
-        var root = parseHtml(html);
-        var out = [];
-        var seen = {};
-
-        function add(url, title) {
-            if (!url) return;
-
-            url = String(url)
-                .replace(/&amp;/g, '&')
-                .replace(/\\\//g, '/')
-                .trim();
-
-            if (!/^https?:\/\//i.test(url)) {
-                url = absoluteUrl(url);
-            }
-
-            // Only direct media URLs publicly present in EX-FS page HTML.
-            // We do NOT fetch embedded third-party player pages to extract streams.
-            if (!/\.(m3u8|mp4)(?:$|[?#])/i.test(url)) return;
-            if (seen[url]) return;
-
-            seen[url] = true;
-
-            out.push({
-                title: title || (/\.m3u8(?:$|[?#])/i.test(url) ? 'HLS' : 'MP4'),
-                url: url,
-                page: pageUrl
-            });
-        }
-
-        // Public DOM attributes on the EX-FS page itself.
-        var attrs = ['src', 'href', 'data-src', 'data-file', 'data-url', 'data-video', 'data-stream'];
-
-        Array.prototype.forEach.call(root.querySelectorAll('*'), function (el) {
-            attrs.forEach(function (attr) {
-                var value = el.getAttribute && el.getAttribute(attr);
-                if (value) add(value, el.getAttribute('title') || '');
-            });
-        });
-
-        // Public media URLs serialized directly in EX-FS page HTML/inline JSON.
-        var text = html || '';
-        var rx = /https?:\\?\/\\?\/[^"'<>\\\s]+?\.(?:m3u8|mp4)(?:\?[^"'<>\\\s]*)?/ig;
-        var match;
-
-        while ((match = rx.exec(text))) {
-            add(match[0], '');
-        }
-
-        return out;
-    }
-
-    function playDirect(media, movie, playlist) {
-        var item = {
-            url: media.url,
-            title: (movie.title || movie.name || 'EX-FS'),
-            isonline: true
-        };
-
-        if (/\.m3u8(?:$|[?#])/i.test(media.url)) {
-            item.hls = true;
-        }
-
-        var list = (playlist && playlist.length ? playlist : [media]).map(function (x) {
-            return {
-                url: x.url,
-                title: x.title || movie.title || movie.name || 'EX-FS',
-                isonline: true,
-                hls: /\.m3u8(?:$|[?#])/i.test(x.url)
-            };
-        });
+        if (!url) return '';
+        if (/^https?:\/\//i.test(url)) return url;
+        if (url.indexOf('//') === 0) return 'https:' + url;
 
         try {
-            Lampa.Player.play(item);
-            Lampa.Player.playlist(list);
+            var a = document.createElement('a');
+            if (url.charAt(0) === '/') {
+                a.href = DOMAIN + url;
+            } else {
+                var p = base.substring(0, base.lastIndexOf('/') + 1);
+                a.href = p + url;
+            }
+            return a.href;
         } catch (e) {
-            console.log('EX-FS direct play error', e);
-            try {
-                Lampa.Noty.show('EX-FS: не вдалося запустити прямий потік');
-            } catch (x) {}
+            if (url.charAt(0) === '/') return DOMAIN + url;
+            return DOMAIN + '/' + url;
         }
     }
 
-    function parsePlayers(pageUrl, html) {
-        var root = parseHtml(html);
-        var players = [];
-        var seen = {};
-
-        var frames = root.querySelectorAll('iframe[src]');
-
-        Array.prototype.forEach.call(frames, function (frame, index) {
-            var src = frame.getAttribute('src') || '';
-            if (!src) return;
-
-            src = absoluteUrl(src);
-
-            // Trailer is not an online movie source.
-            if (/youtube\.com|youtu\.be|youtube-nocookie\.com/i.test(src)) return;
-
-            if (seen[src]) return;
-            seen[src] = true;
-
-            var title =
-                frame.getAttribute('title') ||
-                frame.getAttribute('data-title') ||
-                ('Плеєр ' + (players.length + 1));
-
-            players.push({
-                title: title,
-                url: src,
-                page: pageUrl
-            });
-        });
-
-        return players;
+    function htmlRoot(html) {
+        var box = document.createElement('div');
+        box.innerHTML = html || '';
+        return box;
     }
 
-    function fetchMedia(url, success, error) {
-        request(url, function (html) {
-            var direct = findDirectMedia(url, html);
-            var frames = parsePlayers(url, html);
+    function request(url, oncomplete, onerror, post, extra) {
+        var network = new Lampa.Reguest();
+        var options = extra || {};
 
-            if (!direct.length && !frames.length) {
-                if (error) error('На сторінці EX-FS не знайдено публічних потоків або iframe-плеєрів');
+        network.timeout(options.timeout || 15000);
+
+        var params = {
+            dataType: options.dataType || 'text',
+            headers: options.headers || {
+                'User-Agent': 'Mozilla/5.0 (Linux; Android 10; TV) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Referer': DOMAIN + '/'
+            }
+        };
+
+        /*
+         * In current Lampa, native() uses Android native HTTP on Android
+         * and falls back to the normal request path on other platforms.
+         */
+        network['native'](
+            url,
+            function (data) {
+                if (typeof data !== 'string') {
+                    if (data && typeof data.body === 'string') data = data.body;
+                    else {
+                        try { data = JSON.stringify(data); } catch (e) { data = ''; }
+                    }
+                }
+                if (oncomplete) oncomplete(data || '');
+            },
+            function (a, b) {
+                if (onerror) onerror(a, b, network);
+            },
+            post || false,
+            params
+        );
+
+        return network;
+    }
+
+    function nearestContainer(node) {
+        var cur = node;
+
+        for (var i = 0; i < 6 && cur; i++) {
+            var cls = ' ' + (cur.className || '') + ' ';
+
+            if (
+                / short | story | post | movie | item | card | search | result | th-item | shortstory /i.test(cls) ||
+                /^(article|li)$/i.test(cur.tagName || '')
+            ) {
+                return cur;
+            }
+
+            cur = cur.parentNode;
+        }
+
+        return node.parentNode || node;
+    }
+
+    function titleFromAnchor(a, container) {
+        var value = clean(a.getAttribute('title'));
+
+        if (!value) {
+            var img = a.querySelector && a.querySelector('img[alt]');
+            if (img) value = clean(img.getAttribute('alt'));
+        }
+
+        if (!value) value = clean(a.textContent);
+
+        if ((!value || value.length < 2) && container && container.querySelector) {
+            var h = container.querySelector(
+                'h1,h2,h3,h4,.title,.name,.short-title,.shortstory__title,.th-title,.th-name,.movie-title'
+            );
+            if (h) value = clean(h.textContent);
+        }
+
+        value = value
+            .replace(/\s*(смотреть|дивитися|watch)\s+онлайн.*$/i, '')
+            .replace(/\s*онлайн\s*$/i, '')
+            .trim();
+
+        return value;
+    }
+
+    function parseSearch(html, query, wantedYear) {
+        var root = htmlRoot(html);
+        var anchors = root.querySelectorAll('a[href]');
+        var out = [];
+        var seen = {};
+        var q = normalize(query);
+
+        Array.prototype.forEach.call(anchors, function (a) {
+            var href = clean(a.getAttribute('href'));
+
+            if (!href) return;
+
+            /*
+             * EX-FS has used both /film/ and /films/ over time.
+             * Keep the matcher intentionally broad for its content sections.
+             */
+            if (!/\/(?:film|films|serial|serials|multfilm|multserial|tv-show|show|anime|documental|peredachi)\/[^?#"']+\.html(?:$|[?#])/i.test(href)) {
                 return;
             }
 
-            success({
-                direct: direct,
-                frames: frames
+            var url = absolute(href);
+            if (!url || seen[url]) return;
+
+            var container = nearestContainer(a);
+            var title = titleFromAnchor(a, container);
+            if (!title || title.length < 2) return;
+
+            var allText = clean(container && container.textContent);
+            var ym = allText.match(/\b(19|20)\d{2}\b/);
+            var year = ym ? ym[0] : '';
+            var nt = normalize(title);
+            var score = 0;
+
+            if (nt === q) score += 100;
+            else if (nt.indexOf(q) !== -1 || q.indexOf(nt) !== -1) score += 60;
+            else {
+                var qparts = q.split(' ');
+                var hits = 0;
+
+                qparts.forEach(function (part) {
+                    if (part.length > 1 && nt.indexOf(part) !== -1) hits++;
+                });
+
+                score += hits * 8;
+            }
+
+            if (wantedYear && year && String(wantedYear) === String(year)) score += 30;
+
+            seen[url] = true;
+            out.push({
+                title: title,
+                year: year,
+                url: url,
+                score: score
             });
-        }, function () {
-            if (error) error('Не вдалося завантажити сторінку EX-FS');
         });
+
+        out.sort(function (a, b) {
+            if (b.score !== a.score) return b.score - a.score;
+            if (wantedYear && a.year === String(wantedYear) && b.year !== String(wantedYear)) return -1;
+            if (wantedYear && b.year === String(wantedYear) && a.year !== String(wantedYear)) return 1;
+            return a.title.localeCompare(b.title);
+        });
+
+        return out.slice(0, 25);
     }
 
-    /* ----------------------------------------------------
-     * Fullscreen iframe component
-     * ---------------------------------------------------- */
+    function searchOnce(query, year, done, fail) {
+        var getUrl =
+            DOMAIN +
+            '/index.php?do=search&subaction=search&story=' +
+            encodeURIComponent(query);
 
-    function iframeComponent(object) {
+        request(
+            getUrl,
+            function (html) {
+                var items = parseSearch(html, query, year);
+
+                if (items.length) {
+                    done(items);
+                    return;
+                }
+
+                /*
+                 * DLE installations commonly use POST for the same search form,
+                 * so retry by POST when GET returned no content items.
+                 */
+                var post =
+                    'do=search' +
+                    '&subaction=search' +
+                    '&search_start=0' +
+                    '&full_search=0' +
+                    '&result_from=1' +
+                    '&story=' + encodeURIComponent(query);
+
+                request(
+                    DOMAIN + '/index.php?do=search',
+                    function (html2) {
+                        done(parseSearch(html2, query, year));
+                    },
+                    fail,
+                    post,
+                    {
+                        dataType: 'text',
+                        headers: {
+                            'User-Agent': 'Mozilla/5.0 (Linux; Android 10; TV) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+                            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                            'Referer': DOMAIN + '/'
+                        }
+                    }
+                );
+            },
+            fail
+        );
+    }
+
+    function searchMovie(movie, done, fail) {
+        var title = movie.title || movie.name || '';
+        var original = movie.original_title || movie.original_name || '';
+        var date = movie.release_date || movie.first_air_date || movie.last_air_date || '';
+        var year = (String(date).match(/^(19|20)\d{2}/) || [''])[0];
+
+        if (!title && original) title = original;
+
+        if (!title) {
+            done([]);
+            return;
+        }
+
+        searchOnce(
+            title,
+            year,
+            function (items) {
+                if (items.length || !original || normalize(original) === normalize(title)) {
+                    done(items);
+                    return;
+                }
+
+                searchOnce(original, year, done, fail);
+            },
+            fail
+        );
+    }
+
+    function parseMedia(pageUrl, html) {
+        var root = htmlRoot(html);
+        var direct = [];
+        var frames = [];
+        var dseen = {};
+        var fseen = {};
+
+        function addDirect(url, title) {
+            url = clean(url)
+                .replace(/&amp;/g, '&')
+                .replace(/\\\//g, '/');
+
+            if (!url) return;
+            url = absolute(url, pageUrl);
+
+            if (!/\.(?:m3u8|mp4)(?:$|[?#])/i.test(url)) return;
+            if (dseen[url]) return;
+
+            dseen[url] = true;
+            direct.push({
+                url: url,
+                title: clean(title) || (/\.m3u8(?:$|[?#])/i.test(url) ? 'HLS' : 'MP4')
+            });
+        }
+
+        function addFrame(url, title) {
+            url = clean(url);
+            if (!url) return;
+
+            url = absolute(url, pageUrl);
+
+            if (!/^https?:\/\//i.test(url)) return;
+            if (/youtube\.com|youtu\.be|youtube-nocookie\.com/i.test(url)) return;
+            if (fseen[url]) return;
+
+            fseen[url] = true;
+            frames.push({
+                url: url,
+                title: clean(title) || ('Плеєр ' + (frames.length + 1))
+            });
+        }
+
+        Array.prototype.forEach.call(
+            root.querySelectorAll('video[src],video source[src],source[src]'),
+            function (el) {
+                addDirect(el.getAttribute('src'), el.getAttribute('title'));
+            }
+        );
+
+        Array.prototype.forEach.call(root.querySelectorAll('iframe[src]'), function (el) {
+            addFrame(
+                el.getAttribute('src'),
+                el.getAttribute('title') || el.getAttribute('data-title')
+            );
+        });
+
+        /*
+         * Only direct URLs that are already publicly serialized in the EX-FS page.
+         * Do not fetch embedded third-party player pages to extract hidden streams.
+         */
+        var text = String(html || '').replace(/\\\//g, '/');
+        var re = /https?:\/\/[^"'<> \t\r\n\\]+?\.(?:m3u8|mp4)(?:\?[^"'<> \t\r\n\\]*)?/ig;
+        var match;
+
+        while ((match = re.exec(text))) {
+            addDirect(match[0], '');
+        }
+
+        return {
+            direct: direct,
+            frames: frames
+        };
+    }
+
+    function playerTitle(movie, extra) {
+        var base = movie.title || movie.name || movie.original_title || movie.original_name || 'EX-FS';
+        return extra ? base + ' / ' + extra : base;
+    }
+
+    function playDirect(stream, movie) {
+        var first = {
+            url: stream.url,
+            title: playerTitle(movie, stream.title)
+        };
+
+        try {
+            if (movie.id) Lampa.Favorite.add('history', movie, 100);
+        } catch (e) {}
+
+        Lampa.Player.play(first);
+        Lampa.Player.playlist([first]);
+    }
+
+    function openExternal(url) {
+        try {
+            if (Lampa.Platform.is('android') && Lampa.Android && Lampa.Android.openBrowser) {
+                Lampa.Android.openBrowser(url);
+                return;
+            }
+        } catch (e) {}
+
+        try {
+            window.open(url, '_blank');
+        } catch (e2) {
+            try { window.location.href = url; } catch (e3) {}
+        }
+    }
+
+    function frameComponent(object) {
+        var html = $('<div class="exfs-frame"></div>');
+        var iframe = null;
         var self = this;
-        var html = $('<div></div>');
-        var frame = null;
 
         this.create = function () {
             html.css({
                 position: 'fixed',
                 left: '0',
                 top: '0',
-                right: '0',
-                bottom: '0',
                 width: '100%',
                 height: '100%',
-                background: '#000',
-                zIndex: '9999'
+                zIndex: '9999',
+                background: '#000'
             });
 
-            frame = $('<iframe></iframe>');
+            iframe = $('<iframe></iframe>');
 
-            frame.attr({
-                src: object.url,
+            iframe.attr({
+                src: object.frame_url,
                 allow: 'autoplay; fullscreen; picture-in-picture; encrypted-media',
                 allowfullscreen: 'true',
-                referrerpolicy: 'no-referrer-when-downgrade'
+                referrerpolicy: 'origin-when-cross-origin'
             });
 
-            frame.css({
+            iframe.css({
                 width: '100%',
                 height: '100%',
                 border: '0',
                 background: '#000'
             });
 
-            html.append(frame);
+            html.append(iframe);
 
             return this.render();
         };
@@ -399,100 +456,276 @@
         };
 
         this.start = function () {
-            Lampa.Controller.add('exfs_iframe', {
-                toggle: function () {},
+            Lampa.Controller.add('exfs_frame', {
+                toggle: function () {
+                    try {
+                        if (iframe && iframe[0]) iframe[0].focus();
+                    } catch (e) {}
+                },
                 up: function () {},
                 down: function () {},
                 left: function () {},
                 right: function () {},
-                back: self.back
+                back: this.back
             });
 
-            Lampa.Controller.toggle('exfs_iframe');
+            Lampa.Controller.toggle('exfs_frame');
 
-            // Try focusing iframe so Android TV/WebView can forward keys.
             setTimeout(function () {
                 try {
-                    frame && frame[0] && frame[0].focus();
+                    if (iframe && iframe[0]) iframe[0].focus();
                 } catch (e) {}
             }, 300);
         };
-
-        this.pause = function () {};
-
-        this.stop = function () {};
 
         this.back = function () {
             Lampa.Activity.backward();
         };
 
+        this.pause = function () {};
+        this.stop = function () {};
+
         this.destroy = function () {
             try {
-                if (frame) {
-                    frame.attr('src', 'about:blank');
-                    frame.remove();
+                if (iframe) {
+                    iframe.attr('src', 'about:blank');
+                    iframe.remove();
                 }
                 html.remove();
             } catch (e) {}
+
+            iframe = null;
+            html = null;
         };
     }
 
-    function openIframe(player, movie) {
+    function openFrame(frame, movie) {
         Lampa.Activity.push({
             url: '',
-            title: 'EX-FS - ' + (movie.title || movie.name || ''),
-            component: 'exfs_iframe',
+            title: playerTitle(movie, frame.title),
+            component: FRAME_COMPONENT,
+            frame_url: frame.url,
             movie: movie,
-            player: player,
-            page: 1,
-            url_player: player.url,
-            // iframeComponent reads object.url below:
-            url: player.url
+            page: 1
         });
     }
 
-    /* ----------------------------------------------------
-     * EX-FS result component
-     * ---------------------------------------------------- */
+    function row(title, subtitle) {
+        return $(
+            '<div class="online selector">' +
+                '<div class="online__title">' + esc(title) + '</div>' +
+                '<div class="online__quality">' + esc(subtitle || '') + '</div>' +
+            '</div>'
+        );
+    }
 
     function component(object) {
         var self = this;
-        var initialized = false;
         var network = new Lampa.Reguest();
-        var scroll = new Lampa.Scroll({ mask: true, over: true });
+        var scroll = new Lampa.Scroll({
+            mask: true,
+            over: true
+        });
         var files = new Lampa.Explorer(object);
-        var html = $('<div></div>');
-        var filter = new Lampa.Filter(object);
+        var last = null;
+        var searchResults = [];
+
+        scroll.body().addClass('torrent-list');
+        scroll.minus(files.render().find('.explorer__files-head'));
 
         this.create = function () {
-            scroll.minus();
+            this.activity.loader(true);
             files.appendFiles(scroll.render());
-            files.appendHead(filter.render());
+            this.search();
             return this.render();
         };
 
-        this.render = function () {
-            return files.render();
+        this.reset = function () {
+            last = null;
+            scroll.render().find('.empty').remove();
+            scroll.clear();
+            scroll.reset();
         };
 
-        this.start = function () {
+        this.loading = function (status) {
+            this.activity.loader(!!status);
+        };
+
+        this.empty = function (message) {
+            this.reset();
+
+            var empty = Lampa.Template.get('list_empty');
+            if (message) empty.find('.empty__descr').text(message);
+
+            scroll.append(empty);
+            this.loading(false);
+            this.start(false);
+        };
+
+        this.append = function (item) {
+            item.on('hover:focus', function (e) {
+                last = e.target;
+                scroll.update($(e.target), true);
+            });
+
+            scroll.append(item);
+        };
+
+        this.showSearchResults = function (items) {
+            searchResults = items || [];
+            this.reset();
+
+            if (!searchResults.length) {
+                this.empty('EX-FS: нічого не знайдено');
+                return;
+            }
+
+            searchResults.forEach(function (item) {
+                var subtitle = 'EX-FS' + (item.year ? ' • ' + item.year : '');
+                var card = row(item.title, subtitle);
+
+                card.on('hover:enter', function () {
+                    self.openPage(item);
+                });
+
+                self.append(card);
+            });
+
+            this.loading(false);
+            this.start(true);
+        };
+
+        this.search = function () {
+            this.loading(true);
+
+            searchMovie(
+                object.movie || {},
+                function (items) {
+                    self.showSearchResults(items);
+                },
+                function (a, b, req) {
+                    var msg = 'EX-FS: помилка мережі';
+
+                    try {
+                        msg += ' — ' + req.errorDecode(a, b);
+                    } catch (e) {}
+
+                    self.empty(msg);
+                }
+            );
+        };
+
+        this.openPage = function (result) {
+            this.loading(true);
+            this.reset();
+
+            network.clear();
+            network.timeout(15000);
+
+            network['native'](
+                result.url,
+                function (html) {
+                    if (typeof html !== 'string') {
+                        if (html && typeof html.body === 'string') html = html.body;
+                        else html = String(html || '');
+                    }
+
+                    var media = parseMedia(result.url, html);
+
+                    var back = row('← Назад до результатів', result.title);
+                    back.on('hover:enter', function () {
+                        self.showSearchResults(searchResults);
+                    });
+                    self.append(back);
+
+                    if (media.direct.length) {
+                        media.direct.forEach(function (stream, index) {
+                            var kind = /\.m3u8(?:$|[?#])/i.test(stream.url) ? 'HLS' : 'MP4';
+                            var item = row(
+                                '▶ Прямий потік ' + (index + 1),
+                                kind + ' • Lampa.Player'
+                            );
+
+                            item.on('hover:enter', function () {
+                                playDirect(stream, object.movie || {});
+                            });
+
+                            self.append(item);
+                        });
+                    }
+
+                    media.frames.forEach(function (frame, index) {
+                        var item = row(
+                            frame.title || ('Плеєр ' + (index + 1)),
+                            'EX-FS • iframe'
+                        );
+
+                        item.on('hover:enter', function () {
+                            openFrame(frame, object.movie || {});
+                        });
+
+                        self.append(item);
+                    });
+
+                    var external = row('Відкрити сторінку EX-FS', result.url);
+                    external.on('hover:enter', function () {
+                        openExternal(result.url);
+                    });
+                    self.append(external);
+
+                    if (!media.direct.length && !media.frames.length) {
+                        var no = row(
+                            'Плеєри не знайдені',
+                            'На сторінці немає публічного прямого потоку або iframe'
+                        );
+                        self.append(no);
+                    } else if (!media.direct.length && media.frames.length) {
+                        var info = row(
+                            'Прямого HLS/MP4 немає',
+                            'EX-FS віддає цю сторінку через iframe-плеєри'
+                        );
+                        self.append(info);
+                    }
+
+                    self.loading(false);
+                    self.start(true);
+                },
+                function (a, b) {
+                    var msg = 'EX-FS: не вдалося відкрити сторінку';
+
+                    try {
+                        msg += ' — ' + network.errorDecode(a, b);
+                    } catch (e) {}
+
+                    self.empty(msg);
+                },
+                false,
+                {
+                    dataType: 'text',
+                    headers: {
+                        'User-Agent': 'Mozilla/5.0 (Linux; Android 10; TV) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                        'Referer': DOMAIN + '/'
+                    }
+                }
+            );
+        };
+
+        this.start = function (firstSelect) {
             if (Lampa.Activity.active().activity !== this.activity) return;
 
-            if (!initialized) {
-                initialized = true;
-                this.initialize();
+            if (firstSelect) {
+                last = scroll.render().find('.selector').eq(0)[0] || null;
             }
 
             try {
-                Lampa.Background.immediately(
-                    Lampa.Utils.cardImgBackgroundBlur(object.movie)
-                );
+                Lampa.Background.immediately(Lampa.Utils.cardImgBackground(object.movie));
             } catch (e) {}
 
             Lampa.Controller.add('content', {
                 toggle: function () {
                     Lampa.Controller.collectionSet(scroll.render(), files.render());
-                    Lampa.Controller.collectionFocus(false, scroll.render());
+                    Lampa.Controller.collectionFocus(last || false, scroll.render());
                 },
                 up: function () {
                     if (typeof Navigator !== 'undefined' && Navigator.canmove('up')) {
@@ -504,11 +737,17 @@
                 down: function () {
                     if (typeof Navigator !== 'undefined') Navigator.move('down');
                 },
-                left: function () {
-                    Lampa.Controller.toggle('menu');
-                },
                 right: function () {
-                    if (typeof Navigator !== 'undefined') Navigator.move('right');
+                    if (typeof Navigator !== 'undefined' && Navigator.canmove('right')) {
+                        Navigator.move('right');
+                    }
+                },
+                left: function () {
+                    if (typeof Navigator !== 'undefined' && Navigator.canmove('left')) {
+                        Navigator.move('left');
+                    } else {
+                        Lampa.Controller.toggle('menu');
+                    }
                 },
                 back: this.back
             });
@@ -516,349 +755,121 @@
             Lampa.Controller.toggle('content');
         };
 
-        this.pause = function () {};
-
-        this.stop = function () {};
+        this.render = function () {
+            return files.render();
+        };
 
         this.back = function () {
             Lampa.Activity.backward();
         };
 
+        this.pause = function () {};
+        this.stop = function () {};
+
         this.destroy = function () {
             try { network.clear(); } catch (e) {}
-            try { scroll.destroy(); } catch (e) {}
-            try { files.destroy(); } catch (e) {}
-            try { filter.destroy(); } catch (e) {}
-            try { html.remove(); } catch (e) {}
-        };
+            try { files.destroy(); } catch (e2) {}
+            try { scroll.destroy(); } catch (e3) {}
 
-        function clear() {
-            html.empty();
-        }
-
-        function showError(text) {
-            clear();
-            var empty = new Lampa.Empty({ text: text });
-            html.append(empty.render());
-            scroll.append(html);
-        }
-
-        function addRow(title, subtitle, enter) {
-            var item = $(
-                '<div class="online selector">' +
-                    '<div class="online__title">' + escapeHtml(title) + '</div>' +
-                    '<div class="online__quality">' + escapeHtml(subtitle || '') + '</div>' +
-                '</div>'
-            );
-
-            item.on('hover:enter', enter);
-            html.append(item);
-        }
-
-        function showPlayers(result) {
-            clear();
-
-            addRow(
-                'Відкрити сторінку EX-FS',
-                result.url,
-                function () {
-                    // Fallback for providers that block iframe embedding.
-                    try {
-                        var w = window.open(result.url, '_blank');
-                        if (!w) window.location.href = result.url;
-                    } catch (e) {
-                        window.location.href = result.url;
-                    }
-                }
-            );
-
-            fetchMedia(result.url, function (media) {
-                var movie = object.movie || {};
-
-                if (media.direct.length) {
-                    media.direct.forEach(function (stream, index) {
-                        addRow(
-                            '▶ Прямий потік ' + (index + 1),
-                            (/\.m3u8(?:$|[?#])/i.test(stream.url) ? 'HLS • штатний Lampa.Player' : 'MP4 • штатний Lampa.Player'),
-                            function () {
-                                playDirect(stream, movie, media.direct);
-                            }
-                        );
-                    });
-                }
-
-                media.frames.forEach(function (player, index) {
-                    addRow(
-                        'Плеєр ' + (index + 1) + ' (iframe)',
-                        player.url.replace(/^https?:\/\//, ''),
-                        function () {
-                            openIframe(player, movie);
-                        }
-                    );
-                });
-
-                if (!media.direct.length && media.frames.length) {
-                    addRow(
-                        'Прямого потоку немає',
-                        'EX-FS віддає лише iframe; штатний Lampa.Player тут недоступний',
-                        function () {}
-                    );
-                }
-
-                scroll.append(html);
-                self.activity.loader(false);
-                self.activity.toggle();
-                Lampa.Controller.enable('content');
-            }, function (msg) {
-                addRow('Плеєри не знайдені', msg, function () {});
-                scroll.append(html);
-                self.activity.loader(false);
-                self.activity.toggle();
-                Lampa.Controller.enable('content');
-            });
-        }
-
-        function showResults(results) {
-            clear();
-
-            if (!results.length) {
-                showError('EX-FS: нічого не знайдено');
-                self.activity.loader(false);
-                self.activity.toggle();
-                return;
-            }
-
-            results.slice(0, 15).forEach(function (result) {
-                addRow(
-                    result.title,
-                    result.year ? ('EX-FS • ' + result.year) : 'EX-FS',
-                    function () {
-                        self.activity.loader(true);
-                        showPlayers(result);
-                    }
-                );
-            });
-
-            scroll.append(html);
-            self.activity.loader(false);
-            self.activity.toggle();
-            Lampa.Controller.enable('content');
-        }
-
-        this.initialize = function () {
-            this.activity.loader(true);
-
-            var movie = object.movie || {};
-            var title = movie.title || movie.name || movie.original_title || '';
-            var year =
-                (movie.release_date || movie.first_air_date || '').slice(0, 4);
-
-            if (!title) {
-                showError('EX-FS: немає назви для пошуку');
-                this.activity.loader(false);
-                this.activity.toggle();
-                return;
-            }
-
-            searchExfs(title, year, function (results, err) {
-                if (err) {
-                    showError(err.message || 'EX-FS: помилка пошуку');
-                    self.activity.loader(false);
-                    self.activity.toggle();
-                    return;
-                }
-                showResults(results);
-            });
+            network = null;
+            files = null;
+            scroll = null;
         };
     }
 
-    function openExfs(movie) {
+    function loadOnline(movie) {
+        Lampa.Component.add(COMPONENT, component);
+
         Lampa.Activity.push({
             url: '',
-            title: 'EX-FS - ' + (movie.title || movie.name || ''),
-            component: 'exfs_online',
+            title: 'EX-FS',
+            component: COMPONENT,
+            search: movie.title || movie.name || '',
+            search_one: movie.title || movie.name || '',
+            search_two: movie.original_title || movie.original_name || '',
             movie: movie,
             page: 1
         });
     }
 
-    function registerComponent() {
-        if (Lampa.Component && Lampa.Component.add) {
-            Lampa.Component.add('exfs_online', component);
-            Lampa.Component.add('exfs_iframe', iframeComponent);
-        }
-    }
+    function initMain() {
+        Lampa.Component.add(COMPONENT, component);
+        Lampa.Component.add(FRAME_COMPONENT, frameComponent);
 
-    function addOnlineSource() {
-        if (!(Lampa.Online && Lampa.Online.register)) return;
-
-        Lampa.Online.register('exfs', {
-            title: 'EX-FS',
-            search: function (movie, oncomplete) {
-                openExfs(movie);
-                if (oncomplete) oncomplete([]);
-            },
+        var manifest = {
+            type: 'video',
+            version: VERSION,
+            name: 'EX-FS - ' + VERSION,
+            description: 'Перегляд EX-FS у Lampa',
+            component: COMPONENT,
             onContextMenu: function () {
-                return { name: 'EX-FS' };
+                return {
+                    name: 'EX-FS',
+                    description: ''
+                };
+            },
+            onContextLauch: function (object) {
+                loadOnline(object);
             }
-        });
-    }
+        };
 
-    function addExfsButton(root, movie) {
-        if (!root || !root.length || root.find('.view--exfs').length) return;
-
-        var label =
-            '<svg class="button__icon" width="22" height="22" viewBox="0 0 24 24" fill="none">' +
-                '<path d="M8 5v14l11-7z" fill="currentColor"/>' +
-            '</svg>' +
-            '<span>EX-FS</span>';
-
-        var button = $(
-            '<div class="full-start__button selector view--online view--exfs">' +
-                label +
-            '</div>'
-        );
-
-        button.on('hover:enter', function () {
-            openExfs(movie);
-        });
-
-        var torrent = root.find('.view--torrent');
-        if (torrent.length) {
-            torrent.after(button);
-            return;
-        }
-
-        var online = root.find('.view--online').first();
-        if (online.length) {
-            online.after(button);
-            return;
-        }
-
-        var box = root.find('.full-start-new__buttons');
-        if (!box.length) box = root.find('.full-start__buttons');
-        if (box.length) box.prepend(button);
-    }
-
-    function addCardButton() {
-        var styleId = 'exfs-plugin-style';
-
-        if (!document.getElementById(styleId)) {
-            var st = document.createElement('style');
-            st.id = styleId;
-            st.innerHTML =
-                '.full-start__button.view--exfs{background:#202020;color:#fff}' +
-                '.view--exfs .button__icon{margin-right:.4em}';
-            document.head.appendChild(st);
-        }
+        Lampa.Manifest.plugins = manifest;
 
         Lampa.Listener.follow('full', function (e) {
             if (e.type !== 'complite') return;
-            addExfsButton(e.object.activity.render(), e.data.movie);
-        });
 
-        // If plugin is installed while a movie card is already open,
-        // add the button without requiring navigation away first.
-        try {
-            var active = Lampa.Activity.active();
-            if (active && active.component === 'full' && active.activity) {
-                addExfsButton(active.activity.render(), active.card || active.movie || {});
-            }
-        } catch (e) {}
-    }
+            var root = e.object.activity.render();
+            if (root.find('.view--exfs').length) return;
 
-    function addSettings() {
-        if (!(Lampa.SettingsApi && Lampa.SettingsApi.addComponent)) return;
+            var button = $(
+                '<div class="full-start__button selector view--exfs" data-subtitle="EX-FS ' + VERSION + '">' +
+                    '<svg width="26" height="26" viewBox="0 0 24 24" fill="currentColor">' +
+                        '<path d="M8 5v14l11-7z"></path>' +
+                    '</svg>' +
+                    '<span>EX-FS</span>' +
+                '</div>'
+            );
 
-        Lampa.SettingsApi.addComponent({
-            component: 'exfs',
-            name: 'EX-FS',
-            icon:
-                '<svg width="24" height="24" viewBox="0 0 24 24" fill="none">' +
-                    '<rect x="3" y="4" width="18" height="16" rx="2" stroke="currentColor" stroke-width="2"/>' +
-                    '<path d="M10 8l6 4-6 4V8z" fill="currentColor"/>' +
-                '</svg>'
-        });
+            button.on('hover:enter', function () {
+                loadOnline(e.data.movie);
+            });
 
-        Lampa.SettingsApi.addParam({
-            component: 'exfs',
-            param: {
-                name: STORAGE.domain,
-                type: 'input',
-                values: '',
-                default: 'https://ex-fs.net'
-            },
-            field: {
-                name: 'Домен EX-FS',
-                description: 'Основний домен сайту'
+            var torrent = root.find('.view--torrent');
+
+            if (torrent.length) {
+                torrent.after(button);
+            } else {
+                var buttons = root.find('.full-start-new__buttons');
+                if (!buttons.length) buttons = root.find('.full-start__buttons');
+                if (buttons.length) buttons.prepend(button);
             }
         });
-
-        Lampa.SettingsApi.addParam({
-            component: 'exfs',
-            param: {
-                name: STORAGE.proxy,
-                type: 'input',
-                values: '',
-                default: ''
-            },
-            field: {
-                name: 'CORS-проксі',
-                description:
-                    'Необов’язково. Можна вказати https://proxy.example/{url} або https://proxy.example/'
-            }
-        });
-    }
-
-    function registerManifest() {
-        try {
-            Lampa.Manifest.plugins = manifest;
-        } catch (e) {
-            console.log('EX-FS manifest error', e);
-        }
     }
 
     function startPlugin() {
-        if (window.exfs_plugin_started) return;
-        window.exfs_plugin_started = true;
+        if (!window.Lampa || !Lampa.Component || !Lampa.Activity || !Lampa.Reguest) {
+            setTimeout(startPlugin, 250);
+            return;
+        }
+
+        if (window.__exfs_v4_started) return;
+        window.__exfs_v4_started = true;
 
         try {
-            ensureDefaults();
-            registerManifest();
-            registerComponent();
-            addSettings();
-            addCardButton();
+            initMain();
+            console.log('EX-FS', 'v' + VERSION + ' started');
 
-            console.log('EX-FS', 'plugin v0.3.0 started');
-            try { Lampa.Noty.show('EX-FS v0.3 завантажено'); } catch (e) {}
+            try {
+                Lampa.Noty.show('EX-FS v' + VERSION + ' завантажено');
+            } catch (e) {}
         } catch (e) {
             console.log('EX-FS start error', e);
+
             try {
-                Lampa.Noty.show('EX-FS: помилка запуску — ' + e.message);
+                Lampa.Noty.show('EX-FS: помилка запуску — ' + (e.message || e));
             } catch (x) {}
         }
     }
 
-    function bootstrap() {
-        if (typeof Lampa === 'undefined') {
-            setTimeout(bootstrap, 200);
-            return;
-        }
-
-        if (window.appready) {
-            startPlugin();
-        } else if (Lampa.Listener && Lampa.Listener.follow) {
-            Lampa.Listener.follow('app', function (e) {
-                if (e.type === 'ready') startPlugin();
-            });
-
-            setTimeout(function () {
-                if (window.appready) startPlugin();
-            }, 1000);
-        } else {
-            startPlugin();
-        }
-    }
-
-    bootstrap();
+    startPlugin();
 })();
